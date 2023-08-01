@@ -1,15 +1,13 @@
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 from torch import Tensor
-from einops import rearrange
-from einops import einsum
-from einops import repeat
+from typing import List
 
-class MultiScaleRetention(nn.Module):
+from .msr import MultiScaleRetention
+from .utils import MLP
+
+class RetNet(nn.Module):
     '''
-        Multi-Scale Retention layer as introduced in:
+        Retentive Network as introduced in:
         `Retentive Network: A Successor to Transformer for Large Language Models`
         (https://arxiv.org/abs/2307.08621)
 
@@ -23,269 +21,62 @@ class MultiScaleRetention(nn.Module):
 
     def __init__(
         self,
-        embed_dim : int,
-        num_heads : int,
+        num_layer : int = 6,
+        num_heads : int = 8,
+        dim_model : int = 512,
+        dropout : float = 0.1,
         value_factor : int = 2,
-        gate_fn : str = 'silu'
+        msr_gate_fn : str = 'gelu',
+        mlp_gate_fn : str = 'gelu',
+        mlp_mult : int | List[int] = 4,
+        mlp_bias : bool = True,
     ) -> None:
-        super(MultiScaleRetention, self).__init__()
+        super().__init__()
 
-        assert_msg = f'Embedding dimension ({embed_dim} x {value_factor}) not divisible by the number of attention heads ({num_heads}).'
-        assert (embed_dim * value_factor) % num_heads == 0, assert_msg
-        
-        self.embed_dim = embed_dim
+        self.num_layer = num_layer
         self.num_heads = num_heads
-        self.keys_dim = embed_dim // num_heads
-        self.head_dim = (embed_dim * value_factor) // num_heads
+        self.dim_model = dim_model
 
-        self.scaling = self.keys_dim ** -0.5
-        self.value_factor = value_factor
-
-        # Parameters used for positional encodings
-        angle = 1.0 / (10000 ** torch.linspace(0, 1, embed_dim // num_heads // 2))
-        angle = repeat(angle, 'n -> n 2')
-        decay = torch.log(1 - 2 ** (-5 - torch.arange(num_heads)))
-
-        self.register_buffer('angle', angle)
-        self.register_buffer('decay', decay)
-
-        match gate_fn:
-            case 'silu': self.gate_fn = F.silu
-            case 'gelu': self.gate_fn = F.gelu
-            case 'relu': self.gate_fn = F.relu
-            case 'selu': self.gate_fn = F.selu
-            case 'sigmoid': self.gate_fn = F.sigmoid
-            case _: raise ValueError(f'Unknown gating function {gate_fn}')
-
-        # Build the query, key, value, gate and output projection matrices
-        self.q_proj = nn.Linear(embed_dim, embed_dim)
-        self.k_proj = nn.Linear(embed_dim, embed_dim)
-        self.v_proj = nn.Linear(embed_dim, embed_dim * value_factor)
-        self.g_proj = nn.Linear(embed_dim, embed_dim * value_factor)
-        self.o_proj = nn.Linear(embed_dim * value_factor, embed_dim)
-
-        # Scale-invariant group normalization layer
-        self.norm = nn.GroupNorm(num_groups=num_heads, num_channels=embed_dim)
+        self.layers = nn.ModuleList([(
+                MultiScaleRetention(
+                    dim_model = dim_model,
+                    num_heads = num_heads,
+                    gate_fn = msr_gate_fn,
+                    value_factor = value_factor
+                ),
+                MLP(
+                    dim_model = dim_model,
+                    dim_mult = mlp_mult,
+                    gate_fn = mlp_gate_fn,
+                    dropout = dropout,
+                    bias = mlp_bias
+                )
+            ) for _ in range(num_layer)]
+        )
 
     def forward(
         self,
         x : Tensor,
         num_chunk : int | None = None,
-        pos_embed : Tensor | None = None,
         attn_mask : Tensor | None = None,
     ) -> Tensor:
         '''
-            Forward pass of the Multi-Scale Retention layer.
+            Forward pass of the RetNet. Can use either the parallel implementation
+            of the multi-scale retention (a.k.a. attention) mechanism or the
+            chunk-recurrent implementation. The parallel implementation is faster
+            (for training) but more memory hungry, while chunk-recurrent has lower
+            memory consumption and is ideal for long-sequences at inference time.
 
             Args:
-            - x [Tensor]: Input tensor of shape [batch_size, seq_length, embed_dim]
+            - x [Tensor]: Input tensor of shape [batch_size, seq_len, dim_model]
 
             Params:
-            - pos_embed [Tensor]: Optional positional embedding tensor of shape [seq_length, embed_dim]
-            - attn_mask [Tensor]: Optional attention mask to implement causal masking or other
-                masking mechanism relevant to the problem structure.
-
-            Returns:
-            - attn_out [Tensor]: Output tensor of shape [batch_size, seq_length, embed_dim]
+            - num_chunk [int|None]: Number of chunk to split the input sequence into.
+                Use None (no-splitting) to trigger the parallel computation. The number
         '''
 
-        # Project input tensor to get the query, key and value
-        qry = self.q_proj(x)
-        key = self.k_proj(x)
-        val = self.v_proj(x)
+        for msr, mlp in self.layers:
+            # These are eq.(9) in the original paper
+            x = msr(x, num_chunk=num_chunk, attn_mask=attn_mask) + x
+            x = mlp(x) + x
 
-        gate = self.g_proj(x)
-
-        # Standard query-key normalization, multiply here before passing to specific forward implementations
-        key *= self.scaling
-
-        # Prepare query-key-value to have the appropriate multi-head tensor shape
-        qry = rearrange(qry, 'b n (h d) -> b h n d', h = self.num_heads)
-        key = rearrange(key, 'b n (h d) -> b h n d', h = self.num_heads)
-        val = rearrange(val, 'b n (h d) -> b h n d', h = self.num_heads)
-
-        # Add positional embedding to both key and query vectors
-        qry = self._rot_embed(qry, pos_embed)
-        key = self._rot_embed(key, pos_embed)
-
-        if num_chunk:
-            output = self._recurrent_forward(
-                qry, key, val, num_chunk=num_chunk, attn_mask=attn_mask 
-            )
-        else:
-            output = self._parallel_forward(
-                qry, key, val, attn_mask=attn_mask
-            )
-
-        # Apply group normalization and non-linear gated connection
-        output = self.norm(output)
-        output = self.gate_fn(gate) * output
-
-        # Return output projection of computed attention (retention)
-        return self.o_proj(output)
-
-    def _parallel_forward(
-        self,
-        qry : Tensor,
-        key : Tensor,
-        val : Tensor,
-        attn_mask : Tensor | None = None,
-    ) -> Tensor:
-        '''
-            Parallel implementation of forward pass for the Multi-Scale Retention Layer.
-            This is basically equivalent to a standard forward pass for a Transformer network.
-
-            Args:
-            - qry [Tensor]: Query tensor of shape [batch_size, num_heads, seq_length, head_dim]
-            - key [Tensor]: Key   tensor of shape [batch_size, num_heads, seq_length, head_dim]
-            - val [Tensor]: Value tensor of shape [batch_size, num_heads, seq_length, head_dim (*)]
-
-            Params:
-            - attn_mask [Tensor]: Optional attention mask to implement causal masking or other
-                masking mechanism relevant to the problem structure.
-
-            (*) NOTE: Value head dimension differs from key/query head dimension in the general case
-                      by a factor of `value_factor`.
-
-            Returns:
-            - attn_out [Tensor]: Output tensor of shape [batch_size, num_heads, seq_length, embed_dim]
-        '''
-
-        # Reshape value tensor into multi-head formulation
-        val = rearrange(val, 'b n (h d) -> b h n d', h = self.num_heads).contiguous()
-
-        ret_mat = einsum(qry, key, 'b h i d, b h j d -> b h i j')
-
-        if attn_mask is not None:
-            ret_mat *= attn_mask
-            ret_mat = torch.nan_to_num(ret_mat)
-
-        # Normalize the retention matrix for numerical stability (normalize #3 in the original paper)
-        ret_mat /= ret_mat.detach().sum(dim=-1, keepdim=True).abs().clamp(min=1)
-
-        attn_out = einsum(ret_mat, val, 'b h i j, b h j d -> b h i d')
-        attn_out = rearrange(attn_out, 'b h n d -> b n (h d)').contiguous()
-
-        return attn_out
-    
-    def _recurrent_forward(
-        self,
-        qry : Tensor,
-        key : Tensor,
-        val : Tensor,
-        num_chunk : int = 1,
-        attn_mask : Tensor | None = None,
-    ) -> Tensor:
-        '''
-            Recurrent implementation of forward pass for the Multi-Scale Retention Layer.
-            This formulation is the main innovation of the Ret-Net architecture as it offer a
-            constant-memory inference cost (for input sequence length) which improves on the
-            costly quadratic formulation of the default Transformer.
-
-            Args:
-            - qry [Tensor]: Query tensor of shape [batch_size, num_heads, seq_length, head_dim]
-            - key [Tensor]: Key   tensor of shape [batch_size, num_heads, seq_length, head_dim]
-            - val [Tensor]: Value tensor of shape [batch_size, num_heads, seq_length, head_dim (*)]
-
-
-            (*) NOTE: Value head dimension differs from key/query head dimension in the general case
-                      by a factor of `value_factor`.
-
-            Params:
-            - num_chunk [int]: Number of chunks to split the input tensor into. This is the main
-                parameter to tune for the recurrent formulation.
-            - attn_mask [Tensor]: Optional attention mask to implement causal masking or other
-                masking mechanism relevant to the problem structure.
-
-            Returns:
-            - attn_out [Tensor]: Output tensor of shape [batch_size, seq_length, embed_dim]
-        '''
-
-        (bs, num_head, seq_len, emb_dim), device = val.shape, qry.device
-        chunk_size = seq_len // num_chunk
-
-        # Chunk all the input tensor into num_chunk chunks and put is as leading dimension for easy of looping
-        qry, key, val = map(lambda t : rearrange(t, 'b h (c n) d -> c b h n d', c = num_chunk), (qry, key, val))
-        
-        # Within each chunk we apply the standard (parallel) forward pass
-        inner_attn = einsum(qry, key, 'c b h i d, c b h j d -> c b h i j')
-        
-        if attn_mask is not None:
-            inner_attn *= attn_mask
-            inner_attn = torch.nan_to_num(inner_attn)
-
-        # Normalize the within-chunk attention for numerical stability (normalize #3 in the original paper)
-        inner_scale = inner_attn.detach().sum(dim=-1, keepdim=True).abs().clamp(min=1)
-        inner_attn /= inner_scale
-
-        # Compute the within-chunk attention output
-        inner_attn = einsum(inner_attn, val, 'c b h i j, c b h j d -> c b h i d')
-
-        # * Compute the cross-chunk component of attention using recurrent formulation
-        block_idxs = 1 + torch.arange(chunk_size)
-        cross_decay = torch.exp(self.decay * chunk_size).to(device)
-        inner_decay = torch.exp(self.decay * block_idxs).to(device)
-
-        # ! FIXME: Original code normalizes inner_decay using the denominator of the attn_mask
-        # !        but I was planning to normalize attn_mask in the forward pass, so this info
-        # !        is not available to the recurrent formulation. Maybe we should pass it along?
-        # if attn_mask:
-        #     scale = attn_mask.sum(dim=-1, keepdim=True).sqrt()
-        #     inner_decay /= (scale / scale[])
-
-        KV = einsum(key, val, 'c b h n k, c b h n v -> c b h k v')
-
-        cross_chunk = []
-        cross_scale = []
-
-        kv_chunk = torch.zeros_like(KV[0])
-        kv_scale = torch.ones((bs, num_head, 1, emb_dim), device = device)
-
-        for kv in KV:
-            cross_chunk.append(kv / kv_scale)
-            cross_scale.append(kv_scale)
-
-            kv_chunk = kv_chunk * cross_decay + kv
-            kv_scale = kv_chunk.detach().abs().sum(dim=-2, keepdim=True).clamp(min=1)
-
-        cross_chunk = torch.stack(cross_chunk, dim=0)
-        cross_scale = torch.stack(cross_scale, dim=0)
-
-        # Compute the cross-chunk attention (formula (7) in original paper)
-        cross_attn = einsum(qry * inner_decay, cross_chunk, 'c b h n k, c b h k d -> c b h n d')
-
-        # Finally combine within- and cross- attention contributions (with normalizations)
-        attn_out = inner_attn / cross_scale + cross_attn / inner_scale
-
-        # Return the proper sequence by recombining the chunks and heads together
-        attn_out = rearrange(attn_out, 'c b h n d -> b (c n) (h d)').contiguous()
-
-        return attn_out
-
-    def _rot_embed(self, x : Tensor) -> Tensor:
-        '''
-            Add rotatory positional embedding to input tensor.
-
-            Args:
-            - x [Tensor]: Input tensor of shape [batch_size, seq_length, embed_dim]
-
-            Returns:
-            - x [Tensor]: Output tensor with added positional embeddings
-        '''
-
-        (bs, seq_len, _), device = x.shape, x.device
-
-        index = torch.arange(seq_len).to(device)
-        sin = torch.sin(index[:, None] * self.angle[None, :])
-        cos = torch.cos(index[:, None] * self.angle[None, :])
-
-        rot_x = torch.stack((-x[..., 1::2], x[..., ::2]), dim=-1)
-        rot_x = rearrange(x, '... p d -> ... (p d)')
-
-        return x * cos + rot_x * sin
-        
-
-        
-
-
-       
