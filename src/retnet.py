@@ -2,6 +2,8 @@ import torch.nn as nn
 from torch import Tensor
 from typing import List
 
+from torch.nn.functional import pad
+
 from .msr import MultiScaleRetention
 from .utils import MLP
 
@@ -37,19 +39,21 @@ class RetNet(nn.Module):
         self.num_heads = num_heads
         self.dim_model = dim_model
 
-        self.layers = nn.ModuleList([(
-                MultiScaleRetention(
-                    dim_model = dim_model,
-                    num_heads = num_heads,
-                    gate_fn = msr_gate_fn,
-                    value_factor = value_factor
-                ),
-                MLP(
-                    dim_model = dim_model,
-                    dim_mult = mlp_mult,
-                    gate_fn = mlp_gate_fn,
-                    dropout = dropout,
-                    bias = mlp_bias
+        self.layers = [nn.ModuleList(
+                (
+                    MultiScaleRetention(
+                        dim_model = dim_model,
+                        num_heads = num_heads,
+                        gate_fn = msr_gate_fn,
+                        value_factor = value_factor
+                    ),
+                    MLP(
+                        dim_model = dim_model,
+                        dim_mult = mlp_mult,
+                        gate_fn = mlp_gate_fn,
+                        dropout = dropout,
+                        bias = mlp_bias
+                    )
                 )
             ) for _ in range(num_layer)]
         )
@@ -72,11 +76,34 @@ class RetNet(nn.Module):
 
             Params:
             - num_chunk [int|None]: Number of chunk to split the input sequence into.
-                Use None (no-splitting) to trigger the parallel computation. The number
+                Use num_chunk=None (no-splitting) to trigger the parallel computation.
+                Use num_chunk=-1 (full-chunking) to trigger the fully-recurrent computation.
+                    (number of chunks equals sequence length)
+                Default: None
+
+            - attn_mask [Tensor|None]: Attention mask to apply to the input sequence.
+                Default: None
+
+            Returns:
+            - x [Tensor]: Output tensor of shape [batch_size, seq_len, dim_model]
         '''
+
+        bs, seq_len, d_model = x.shape
+
+        if num_chunk: num_chunk = min(num_chunk, seq_len)
+        if num_chunk and num_chunk == -1: num_chunk = seq_len
+        if num_chunk and num_chunk < 0: raise ValueError('Number of chunks should be positive or equal to -1')
+
+        # If num_chunk is provided, pad input sequence with zeros such that it nicely
+        # divides into `num_chunk` chunks.
+        if num_chunk and seq_len % num_chunk > 0:
+            pad_len = seq_len // num_chunk - (seq_len % num_chunk)
+            x = pad(x, (0, 0, 0, pad_len))
 
         for msr, mlp in self.layers:
             # These are eq.(9) in the original paper
             x = msr(x, num_chunk=num_chunk, attn_mask=attn_mask) + x
             x = mlp(x) + x
+
+        return x
 

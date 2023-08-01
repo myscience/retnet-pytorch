@@ -1,6 +1,6 @@
 # Retention Network in Easy PyTorch
 
-A simple and concise implementation of [Retentive Networks](https://arxiv.org/abs/2307.08621) as introduced in *Retentive Network: A Successor to Transformer for Large Language Models*.
+A simple and concise implementation of [Retentive Networks](https://arxiv.org/abs/2307.08621) as introduced in *Retentive Network: A Successor to Transformer for Large Language Models* (2023).
 
 # Usage
 
