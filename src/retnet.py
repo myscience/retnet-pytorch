@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from einops import rearrange
 from einops import einsum
+from einops import repeat
 
 class MultiScaleRetention(nn.Module):
     '''
@@ -40,7 +41,13 @@ class MultiScaleRetention(nn.Module):
         self.scaling = self.keys_dim ** -0.5
         self.value_factor = value_factor
 
-        self.decay = torch.log(1 - 2 ** (-5 - torch.arange(num_heads)))
+        # Parameters used for positional encodings
+        angle = 1.0 / (10000 ** torch.linspace(0, 1, embed_dim // num_heads // 2))
+        angle = repeat(angle, 'n -> n 2')
+        decay = torch.log(1 - 2 ** (-5 - torch.arange(num_heads)))
+
+        self.register_buffer('angle', angle)
+        self.register_buffer('decay', decay)
 
         match gate_fn:
             case 'silu': self.gate_fn = F.silu
@@ -63,14 +70,59 @@ class MultiScaleRetention(nn.Module):
     def forward(
         self,
         x : Tensor,
+        num_chunk : int | None = None,
         pos_embed : Tensor | None = None,
         attn_mask : Tensor | None = None,
     ) -> Tensor:
         '''
             Forward pass of the Multi-Scale Retention layer.
 
-            Args: 
+            Args:
+            - x [Tensor]: Input tensor of shape [batch_size, seq_length, embed_dim]
+
+            Params:
+            - pos_embed [Tensor]: Optional positional embedding tensor of shape [seq_length, embed_dim]
+            - attn_mask [Tensor]: Optional attention mask to implement causal masking or other
+                masking mechanism relevant to the problem structure.
+
+            Returns:
+            - attn_out [Tensor]: Output tensor of shape [batch_size, seq_length, embed_dim]
         '''
+
+        # Project input tensor to get the query, key and value
+        qry = self.q_proj(x)
+        key = self.k_proj(x)
+        val = self.v_proj(x)
+
+        gate = self.g_proj(x)
+
+        # Standard query-key normalization, multiply here before passing to specific forward implementations
+        key *= self.scaling
+
+        # Prepare query-key-value to have the appropriate multi-head tensor shape
+        qry = rearrange(qry, 'b n (h d) -> b h n d', h = self.num_heads)
+        key = rearrange(key, 'b n (h d) -> b h n d', h = self.num_heads)
+        val = rearrange(val, 'b n (h d) -> b h n d', h = self.num_heads)
+
+        # Add positional embedding to both key and query vectors
+        qry = self._rot_embed(qry, pos_embed)
+        key = self._rot_embed(key, pos_embed)
+
+        if num_chunk:
+            output = self._recurrent_forward(
+                qry, key, val, num_chunk=num_chunk, attn_mask=attn_mask 
+            )
+        else:
+            output = self._parallel_forward(
+                qry, key, val, attn_mask=attn_mask
+            )
+
+        # Apply group normalization and non-linear gated connection
+        output = self.norm(output)
+        output = self.gate_fn(gate) * output
+
+        # Return output projection of computed attention (retention)
+        return self.o_proj(output)
 
     def _parallel_forward(
         self,
@@ -210,6 +262,27 @@ class MultiScaleRetention(nn.Module):
 
         return attn_out
 
+    def _rot_embed(self, x : Tensor) -> Tensor:
+        '''
+            Add rotatory positional embedding to input tensor.
+
+            Args:
+            - x [Tensor]: Input tensor of shape [batch_size, seq_length, embed_dim]
+
+            Returns:
+            - x [Tensor]: Output tensor with added positional embeddings
+        '''
+
+        (bs, seq_len, _), device = x.shape, x.device
+
+        index = torch.arange(seq_len).to(device)
+        sin = torch.sin(index[:, None] * self.angle[None, :])
+        cos = torch.cos(index[:, None] * self.angle[None, :])
+
+        rot_x = torch.stack((-x[..., 1::2], x[..., ::2]), dim=-1)
+        rot_x = rearrange(x, '... p d -> ... (p d)')
+
+        return x * cos + rot_x * sin
         
 
         
