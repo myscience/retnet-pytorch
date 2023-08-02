@@ -2,8 +2,6 @@ import torch.nn as nn
 from torch import Tensor
 from typing import List
 
-from torch.nn.functional import pad
-
 from .msr import MultiScaleRetention
 from .utils import MLP
 
@@ -56,7 +54,6 @@ class RetNet(nn.Module):
                     )
                 )
             ) for _ in range(num_layer)]
-        )
 
     def forward(
         self,
@@ -93,12 +90,6 @@ class RetNet(nn.Module):
         if num_chunk: num_chunk = min(num_chunk, seq_len)
         if num_chunk and num_chunk == -1: num_chunk = seq_len
         if num_chunk and num_chunk < 0: raise ValueError('Number of chunks should be positive or equal to -1')
-
-        # If num_chunk is provided, pad input sequence with zeros such that it nicely
-        # divides into `num_chunk` chunks.
-        if num_chunk and seq_len % num_chunk > 0:
-            pad_len = seq_len // num_chunk - (seq_len % num_chunk)
-            x = pad(x, (0, 0, 0, pad_len))
 
         for msr, mlp in self.layers:
             # These are eq.(9) in the original paper

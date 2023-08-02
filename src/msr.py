@@ -41,7 +41,7 @@ class MultiScaleRetention(nn.Module):
         self.dim_model = dim_model
         self.num_heads = num_heads
         self.keys_dim = dim_model // num_heads
-        self.head_dim = (dim_model * value_factor) // num_heads
+        self.vals_dim = (dim_model * value_factor) // num_heads
 
         self.scaling = self.keys_dim ** -0.5
         self.value_factor = value_factor
@@ -49,6 +49,8 @@ class MultiScaleRetention(nn.Module):
         # Parameters used for positional encodings
         angle = 1.0 / (10000 ** torch.linspace(0, 1, dim_model // num_heads // 2))
         angle = repeat(angle, 'n -> n 2')
+        angle = rearrange(angle, 'n r -> 1 (n r)')
+
         decay = torch.log(1 - 2 ** (-5 - torch.arange(num_heads)))
 
         self.register_buffer('angle', angle)
@@ -71,7 +73,7 @@ class MultiScaleRetention(nn.Module):
 
         # Scale-invariant layer and group normalization layer
         self.pre_norm = nn.LayerNorm(dim_model) if pre_norm else nn.Identity()
-        self.norm = nn.GroupNorm(num_groups=num_heads, num_channels=dim_model)
+        self.norm = nn.GroupNorm(num_groups=num_heads, num_channels=dim_model * value_factor)
 
     def forward(
         self,
@@ -94,25 +96,32 @@ class MultiScaleRetention(nn.Module):
             Returns:
             - attn_out [Tensor]: Output tensor of shape [batch_size, seq_length, dim_model]
         '''
+        bs, seq_len, d_model = x.shape
 
         x = self.pre_norm(x)
+        gate = self.g_proj(x)
+
+        # If num_chunk is provided, pad input sequence with zeros such that it nicely
+        # divides into `num_chunk` chunks.
+        if num_chunk and seq_len % num_chunk > 0:
+            chk_len = seq_len // num_chunk
+            pad_len = num_chunk - (seq_len % chk_len)
+            x = F.pad(x, (0, 0, 0, pad_len))
 
         pos_embed = default(pos_embed, self._get_embed(x))
 
         # Project input tensor to get the query, key and value
-        qry = self.q_proj(x)
-        key = self.k_proj(x)
-        val = self.v_proj(x)
-
-        gate = self.g_proj(x)
+        qry : Tensor = self.q_proj(x)
+        key : Tensor = self.k_proj(x)
+        val : Tensor = self.v_proj(x)
 
         # Standard query-key normalization, multiply here before passing to specific forward implementations
         key *= self.scaling
 
         # Prepare query-key-value to have the appropriate multi-head tensor shape
-        qry = rearrange(qry, 'b n (h d) -> b h n d', h = self.num_heads)
-        key = rearrange(key, 'b n (h d) -> b h n d', h = self.num_heads)
-        val = rearrange(val, 'b n (h d) -> b h n d', h = self.num_heads)
+        qry = rearrange(qry, 'b n (h d) -> b h n d', h = self.num_heads).contiguous()
+        key = rearrange(key, 'b n (h d) -> b h n d', h = self.num_heads).contiguous()
+        val = rearrange(val, 'b n (h d) -> b h n d', h = self.num_heads).contiguous()
 
         # Add positional embedding to both key and query vectors
         qry = self._rot_embed(qry, pos_embed)
@@ -126,6 +135,9 @@ class MultiScaleRetention(nn.Module):
             output = self._parallel_forward(
                 qry, key, val, attn_mask=attn_mask
             )
+
+        # Restore the original input shape (undo padding)
+        output = output[..., :seq_len, :]
 
         # Apply group normalization and non-linear gated connection
         output = self.norm(output)
@@ -160,9 +172,6 @@ class MultiScaleRetention(nn.Module):
             Returns:
             - attn_out [Tensor]: Output tensor of shape [batch_size, num_heads, seq_length, dim_model]
         '''
-
-        # Reshape value tensor into multi-head formulation
-        val = rearrange(val, 'b n (h d) -> b h n d', h = self.num_heads).contiguous()
 
         ret_mat = einsum(qry, key, 'b h i d, b h j d -> b h i j')
 
@@ -233,8 +242,17 @@ class MultiScaleRetention(nn.Module):
 
         # * Compute the cross-chunk component of attention using recurrent formulation
         block_idxs = 1 + torch.arange(chunk_size)
+
         cross_decay = torch.exp(self.decay * chunk_size).to(device)
-        inner_decay = torch.exp(self.decay * block_idxs).to(device)
+        inner_decay = torch.exp(torch.outer(self.decay, block_idxs)).to(device)
+        
+        # Cross-decay is applied to each attention head (hence multi-scale), axes have semantics
+        # [chunk, batch, head, seq_length, d_model], so we relay on implicit broadcasting for the [chunk, batch]
+        # dimensions, but we should add two singleton explicit dimensions for the [seq_len, d_model] axes.
+        # Inner-decay is applied to each head and chunk, as for cross-decay we relay on implicit broadcasting
+        # for the [chunk, batch] dimensions, but we should add an explicit singleton dimension for the [d_model]
+        cross_decay = rearrange(cross_decay, 'h -> h 1 1')
+        inner_decay = rearrange(inner_decay, 'h n -> h n 1')
 
         # ! FIXME: Original code normalizes inner_decay using the denominator of the attn_mask
         # !        but I was planning to normalize attn_mask in the forward pass, so this info
@@ -283,11 +301,11 @@ class MultiScaleRetention(nn.Module):
             - embeds [Tuple[Tensor, Tensor]]: Rotational embeddings
         '''
 
-        (bs, seq_len, _), device = x.shape, x.device
+        (bs, seq_len, d_model), device = x.shape, x.device
 
-        index = torch.arange(seq_len).to(device)
-        sin = torch.sin(index[:, None] * self.angle[None, :])
-        cos = torch.cos(index[:, None] * self.angle[None, :])
+        index = torch.arange(seq_len).to(device).unsqueeze(-1)
+        sin = torch.sin(index * self.angle)
+        cos = torch.cos(index * self.angle)
 
         return cos, sin
 
@@ -305,7 +323,7 @@ class MultiScaleRetention(nn.Module):
         cos, sin = pos_embed
 
         rot_x = torch.stack((-x[..., 1::2], x[..., ::2]), dim=-1)
-        rot_x = rearrange(x, '... p d -> ... (p d)')
+        rot_x = rearrange(rot_x, '... p d -> ... (p d)')
 
         return x * cos + rot_x * sin
         

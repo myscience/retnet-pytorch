@@ -23,7 +23,8 @@ class ParallelForwardTest(unittest.TestCase):
     def test_parallel_forward(self):
         
         # Create a dummy input of correct shape
-        dummy_input = torch.randint(0, 100, (1, 1024, 512))
+        dummy_input = torch.randint(0, 100, (1, 1024, 512), dtype = torch.float32)
+        # dummy_input = dummy_input.to(torch.bfloat16)
 
         # Run the model
         output : Tensor = self.retnet(dummy_input)
@@ -48,41 +49,41 @@ class RecurrentForwardTest(unittest.TestCase):
             mlp_bias = True,
         )
 
-    def test_recurrent_forward_no_pad_needed(self):
         # Create a dummy input of correct shape
-        dummy_input = torch.randint(0, 100, (1, 1024, 512))
+        self.dummy_input = torch.randint(0, 100, (1, 1024, 512), dtype=torch.float32)
+
+
+    def test_recurrent_forward_no_pad_needed(self):
 
         # Run the model
-        output : Tensor = self.retnet(dummy_input, num_chunks=8)
+        output : Tensor = self.retnet(self.dummy_input, num_chunk=8)
 
         # Check the output shape
         self.assertEqual(output.shape, (1, 1024, 512))
 
     def test_recurrent_forward_with_pad_needed(self):
-        # Create a dummy input of correct shape
-        dummy_input = torch.randint(0, 100, (1, 1024, 512))
-
+        
         # Run the model
-        output_1 : Tensor = self.retnet(dummy_input, num_chunks=11)
-        output_2 : Tensor = self.retnet(dummy_input, num_chunks=9)
+        output_1 : Tensor = self.retnet(self.dummy_input, num_chunk=11)
+        output_2 : Tensor = self.retnet(self.dummy_input, num_chunk=9)
 
         # Check the output shape
         self.assertEqual(output_1.shape, (1, 1024, 512))
         self.assertEqual(output_2.shape, (1, 1024, 512))
 
     def test_recurrent_forward_edge_cases(self):
-        # Create a dummy input of correct shape
-        dummy_input = torch.randint(0, 100, (1, 1024, 512))
 
         # Run the model
-        output_1 : Tensor = self.retnet(dummy_input, num_chunks=0)
-        output_2 : Tensor = self.retnet(dummy_input, num_chunks=1024)
-        output_3 : Tensor = self.retnet(dummy_input, num_chunks=-1)
-        output_4 : Tensor = self.retnet(dummy_input, num_chunks=5000)
+        output_1 : Tensor = self.retnet(self.dummy_input, num_chunk=0)
+        output_2 : Tensor = self.retnet(self.dummy_input, num_chunk=1024)
+        output_3 : Tensor = self.retnet(self.dummy_input, num_chunk=-1)
+        output_4 : Tensor = self.retnet(self.dummy_input, num_chunk=5000)
 
         # Check the output shape
         self.assertEqual(output_1.shape, (1, 1024, 512))
         self.assertEqual(output_2.shape, (1, 1024, 512))
+        self.assertEqual(output_3.shape, (1, 1024, 512))
+        self.assertEqual(output_4.shape, (1, 1024, 512))
 
 if __name__ == '__main__':
     unittest.main()
