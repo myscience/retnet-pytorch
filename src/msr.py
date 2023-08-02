@@ -74,7 +74,7 @@ class MultiScaleRetention(nn.Module):
 
         # Scale-invariant layer and group normalization layer
         self.pre_norm = nn.LayerNorm(dim_model) if pre_norm else nn.Identity()
-        self.norm = nn.GroupNorm(num_groups=num_heads, num_channels=dim_model * value_factor)
+        self.norm = nn.LayerNorm(self.vals_dim)
 
     def forward(
         self,
@@ -146,11 +146,12 @@ class MultiScaleRetention(nn.Module):
                 qry, key, val, attn_mask=attn_mask
             )
 
-        # Restore the original input shape (undo padding)
+        # Restore the original input shape (undo padding if present)
         output = output[..., :seq_len, :]
 
         # Apply group normalization and non-linear gated connection
         output = self.norm(output)
+        output = rearrange(output, 'b h n d -> b n (h d)').contiguous()
         output = self.gate_fn(gate) * output
 
         # Return output projection of computed attention (retention)
@@ -191,7 +192,8 @@ class MultiScaleRetention(nn.Module):
         ret_mat /= ret_mat.detach().sum(dim=-1, keepdim=True).abs().clamp(min=1)
 
         attn_out = einsum(ret_mat, val, 'b h i j, b h j d -> b h i d')
-        attn_out = rearrange(attn_out, 'b h n d -> b n (h d)').contiguous()
+
+        print('parallel', attn_out[0, 0])
 
         return attn_out
     
@@ -269,6 +271,7 @@ class MultiScaleRetention(nn.Module):
         # we start by computing the KV term (that forms the retention R) for all the
         # chunks in a single pass and then iteratively add the previous chunk's
         # retention to the current one.
+        if exists(attn_mask): val *= attn_mask[:, -1, :, None]
         KV = einsum(key, val, 'c b h n k, c b h n v -> c b h k v')
 
         cross_chunk = []
@@ -278,7 +281,7 @@ class MultiScaleRetention(nn.Module):
         kv_scale = torch.ones((bs, num_head, 1, emb_dim), device = device)
 
         for kv in KV:
-            cross_chunk.append(kv / kv_scale)
+            cross_chunk.append(kv_chunk / kv_scale)
             cross_scale.append(kv_scale)
 
             kv_chunk = kv_chunk * cross_decay + kv
@@ -293,8 +296,8 @@ class MultiScaleRetention(nn.Module):
         # Finally combine within- and cross- attention contributions (with normalizations)
         attn_out = inner_attn / cross_scale + cross_attn / inner_scale
 
-        # Return the proper sequence by recombining the chunks and heads together
-        attn_out = rearrange(attn_out, 'c b h n d -> b (c n) (h d)').contiguous()
+        # Return the proper sequence by recombining the chunks together
+        attn_out = rearrange(attn_out, 'c b h n d -> b h (c n) d').contiguous()
 
         return attn_out
     

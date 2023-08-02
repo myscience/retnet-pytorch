@@ -122,6 +122,35 @@ class RecurrentForwardTest(unittest.TestCase):
         # Check the output shape
         self.assertEqual(output.shape, (1, 1024, 512))
 
+class ConsistencyTest(unittest.TestCase):
+
+    def setUp(self) -> None:
+
+        # Define the retention network
+        self.retnet = RetNet(
+            num_layer = 1,
+            num_heads = 2,
+            dim_model = 8,
+            dropout = 0.0,
+            value_factor = 2,
+            msr_gate_fn = 'gelu',
+            mlp_gate_fn = 'gelu',
+            mlp_mult = 4,
+            mlp_bias = True,
+        )
+
+        # Create a dummy input of correct shape
+        self.dummy_input = torch.randint(0, 100, (1, 5, 8), dtype=torch.float32)
+
+    def test_consistency_parallel_recurrent(self):
+        # Compute the output of the model
+        parallel_forward  = self.retnet(self.dummy_input, num_chunk=None)
+        recurrent_forward = self.retnet(self.dummy_input, num_chunk=2)
+
+        print(torch.abs(parallel_forward - recurrent_forward))
+
+        # Check the consistency: the two output should match
+        self.assertTrue(torch.allclose(parallel_forward, recurrent_forward))
 
 if __name__ == '__main__':
     unittest.main()
