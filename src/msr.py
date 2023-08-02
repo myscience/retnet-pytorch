@@ -9,6 +9,7 @@ from einops import repeat
 
 from typing import Tuple
 
+from .utils import exists
 from .utils import default
 
 class MultiScaleRetention(nn.Module):
@@ -127,6 +128,15 @@ class MultiScaleRetention(nn.Module):
         qry = self._rot_embed(qry, pos_embed)
         key = self._rot_embed(key, pos_embed)
 
+        if exists(attn_mask):
+            # Produce different decayed version of the attention mask for each head
+            attn_mask = torch.exp(attn_mask * rearrange(self.decay, 'h -> h 1 1'))
+            attn_mask = torch.nan_to_num(attn_mask)
+
+            # Normalize the attention mask
+            self.attn_scale = attn_mask.sum(dim=-1, keepdim=True).sqrt()
+            attn_mask /= self.attn_scale
+
         if num_chunk:
             output = self._recurrent_forward(
                 qry, key, val, num_chunk=num_chunk, attn_mask=attn_mask 
@@ -175,9 +185,7 @@ class MultiScaleRetention(nn.Module):
 
         ret_mat = einsum(qry, key, 'b h i d, b h j d -> b h i j')
 
-        if attn_mask is not None:
-            ret_mat *= attn_mask
-            ret_mat = torch.nan_to_num(ret_mat)
+        if exists(attn_mask): ret_mat *= attn_mask
 
         # Normalize the retention matrix for numerical stability (normalize #3 in the original paper)
         ret_mat /= ret_mat.detach().sum(dim=-1, keepdim=True).abs().clamp(min=1)
@@ -223,24 +231,7 @@ class MultiScaleRetention(nn.Module):
         (bs, num_head, seq_len, emb_dim), device = val.shape, qry.device
         chunk_size = seq_len // num_chunk
 
-        # Chunk all the input tensor into num_chunk chunks and put is as leading dimension for easy of looping
-        qry, key, val = map(lambda t : rearrange(t, 'b h (c n) d -> c b h n d', c = num_chunk), (qry, key, val))
-        
-        # Within each chunk we apply the standard (parallel) forward pass
-        inner_attn = einsum(qry, key, 'c b h i d, c b h j d -> c b h i j')
-        
-        if attn_mask is not None:
-            inner_attn *= attn_mask
-            inner_attn = torch.nan_to_num(inner_attn)
-
-        # Normalize the within-chunk attention for numerical stability (normalize #3 in the original paper)
-        inner_scale = inner_attn.detach().sum(dim=-1, keepdim=True).abs().clamp(min=1)
-        inner_attn /= inner_scale
-
-        # Compute the within-chunk attention output
-        inner_attn = einsum(inner_attn, val, 'c b h i j, c b h j d -> c b h i d')
-
-        # * Compute the cross-chunk component of attention using recurrent formulation
+        # * Preliminary work: compute some normalization constants
         block_idxs = 1 + torch.arange(chunk_size)
 
         cross_decay = torch.exp(self.decay * chunk_size).to(device)
@@ -254,13 +245,30 @@ class MultiScaleRetention(nn.Module):
         cross_decay = rearrange(cross_decay, 'h -> h 1 1')
         inner_decay = rearrange(inner_decay, 'h n -> h n 1')
 
-        # ! FIXME: Original code normalizes inner_decay using the denominator of the attn_mask
-        # !        but I was planning to normalize attn_mask in the forward pass, so this info
-        # !        is not available to the recurrent formulation. Maybe we should pass it along?
-        # if attn_mask:
-        #     scale = attn_mask.sum(dim=-1, keepdim=True).sqrt()
-        #     inner_decay /= (scale / scale[])
+        if hasattr(self, 'attn_scale'):
+            # Normalize the inner decay based on the attention mask
+            inner_decay /= (self.attn_scale / self.attn_scale[:, -1, None])
 
+        # * Now we move on to the actual attention computation
+        # Chunk all the input tensor into num_chunk chunks and put is as leading dimension for easy of looping
+        qry, key, val = map(lambda t : rearrange(t, 'b h (c n) d -> c b h n d', c = num_chunk), (qry, key, val))
+        
+        # Within each chunk we apply the standard (parallel) forward pass
+        inner_attn = einsum(qry, key, 'c b h i d, c b h j d -> c b h i j')
+        
+        if exists(attn_mask): inner_attn *= attn_mask
+
+        # Normalize the within-chunk attention for numerical stability (normalize #3 in the original paper)
+        inner_scale = inner_attn.detach().sum(dim=-1, keepdim=True).abs().clamp(min=1)
+        inner_attn /= inner_scale
+
+        # Compute the within-chunk attention output (left-hand side of eq.(7))
+        inner_attn = einsum(inner_attn, val, 'c b h i j, c b h j d -> c b h i d')
+
+        # Now compute the cross-chunk attention output (right-hand side of eq.(7)),
+        # we start by computing the KV term (that forms the retention R) for all the
+        # chunks in a single pass and then iteratively add the previous chunk's
+        # retention to the current one.
         KV = einsum(key, val, 'c b h n k, c b h n v -> c b h k v')
 
         cross_chunk = []

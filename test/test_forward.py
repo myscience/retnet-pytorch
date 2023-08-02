@@ -19,15 +19,33 @@ class ParallelForwardTest(unittest.TestCase):
             mlp_mult = 4,
             mlp_bias = True,
         )
-    
-    def test_parallel_forward(self):
-        
+
         # Create a dummy input of correct shape
-        dummy_input = torch.randint(0, 100, (1, 1024, 512), dtype = torch.float32)
-        # dummy_input = dummy_input.to(torch.bfloat16)
+        self.dummy_input = torch.randint(0, 100, (1, 1024, 512), dtype = torch.float32)
+        
+    def test_parallel_no_attn_mask(self):
+        
+        # Run the model
+        output : Tensor = self.retnet(self.dummy_input)
+
+        # Check the output shape
+        self.assertEqual(output.shape, (1, 1024, 512))
+
+    def test_parallel_with_attn_mask(self):
+
+        # Create a dummy attention mask
+        attn_mask = torch.randint(0, 2, (1024, 1024), dtype = torch.bool)
 
         # Run the model
-        output : Tensor = self.retnet(dummy_input)
+        output : Tensor = self.retnet(self.dummy_input, attn_mask = attn_mask)
+
+        # Check the output shape
+        self.assertEqual(output.shape, (1, 1024, 512))
+
+    def test_parallel_causal_attn_mask(self):
+
+        # Run the model
+        output : Tensor = self.retnet(self.dummy_input, attn_mask = 'causal')
 
         # Check the output shape
         self.assertEqual(output.shape, (1, 1024, 512))
@@ -51,7 +69,6 @@ class RecurrentForwardTest(unittest.TestCase):
 
         # Create a dummy input of correct shape
         self.dummy_input = torch.randint(0, 100, (1, 1024, 512), dtype=torch.float32)
-
 
     def test_recurrent_forward_no_pad_needed(self):
 
@@ -84,6 +101,27 @@ class RecurrentForwardTest(unittest.TestCase):
         self.assertEqual(output_2.shape, (1, 1024, 512))
         self.assertEqual(output_3.shape, (1, 1024, 512))
         self.assertEqual(output_4.shape, (1, 1024, 512))
+
+    def test_recurrent_attn_mask(self):
+
+        # Create a dummy attention mask
+        # NOTE: The attention mask should have shape [chunk_len, chunk_len]
+        attn_mask = torch.randint(0, 2, (1024 // 8, 1024 // 8), dtype = torch.bool)
+
+        # Run the model
+        output : Tensor = self.retnet(self.dummy_input, num_chunk=8, attn_mask=attn_mask)
+
+        # Check the output shape
+        self.assertEqual(output.shape, (1, 1024, 512))
+
+    def test_recurrent_causal_attn_mask(self):
+
+        # Run the model
+        output : Tensor = self.retnet(self.dummy_input, attn_mask = 'causal')
+
+        # Check the output shape
+        self.assertEqual(output.shape, (1, 1024, 512))
+
 
 if __name__ == '__main__':
     unittest.main()

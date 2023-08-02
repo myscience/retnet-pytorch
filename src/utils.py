@@ -4,6 +4,9 @@ from typing import Any, List
 
 from itertools import pairwise
 
+def exists(var : Any | None) -> bool:
+    return var is not None
+
 def default(var : Any | None, val : Any) -> Any:
     return var if var else val
 

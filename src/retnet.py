@@ -1,9 +1,14 @@
+import torch
 import torch.nn as nn
 from torch import Tensor
 from typing import List
 
-from .msr import MultiScaleRetention
+from math import ceil
+
+from .utils import default
 from .utils import MLP
+from .msr import MultiScaleRetention
+
 
 class RetNet(nn.Module):
     '''
@@ -61,7 +66,7 @@ class RetNet(nn.Module):
         self,
         x : Tensor,
         num_chunk : int | None = None,
-        attn_mask : Tensor | None = None,
+        attn_mask : Tensor | str | None = None,
     ) -> Tensor:
         '''
             Forward pass of the RetNet. Can use either the parallel implementation
@@ -89,14 +94,31 @@ class RetNet(nn.Module):
 
         bs, seq_len, d_model = x.shape
 
+        if isinstance(attn_mask, str) and attn_mask == 'causal':
+            attn_mask = self._get_causal_mask(x, num_chunk)
+
         if num_chunk: num_chunk = min(num_chunk, seq_len)
         if num_chunk and num_chunk == -1: num_chunk = seq_len
         if num_chunk and num_chunk < 0: raise ValueError('Number of chunks should be positive or equal to -1')
 
         for msr, mlp in self.layers:
             # These are eq.(9) in the original paper
+            # NOTE: Both MSR and MLP do layer normalization on the input
+            #       before the attention and MLP computations.
             x = msr(x, num_chunk=num_chunk, attn_mask=attn_mask) + x
             x = mlp(x) + x
 
         return x
 
+    def _get_causal_mask(self, x : Tensor, num_chunk : int | None) -> Tensor:
+        (_, seq_len, _), device = x.shape, x.device
+
+        num_chunk = default(num_chunk, 1)
+
+        attn_dim = ceil(seq_len / num_chunk)
+        attn_val = torch.arange(attn_dim, device=device, dtype=float)
+
+        attn_mask = torch.tril(torch.ones(attn_dim, attn_dim, device=device))
+        attn_mask = torch.masked_fill(attn_val[:, None] - attn_val[None, :], ~attn_mask.bool(), torch.inf)
+
+        return torch.exp(attn_mask)
