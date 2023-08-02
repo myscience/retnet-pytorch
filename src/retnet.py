@@ -37,7 +37,8 @@ class RetNet(nn.Module):
         self.num_heads = num_heads
         self.dim_model = dim_model
 
-        self.layers = [nn.ModuleList(
+        self.layers = nn.ModuleList(
+            [nn.ModuleList(
                 (
                     MultiScaleRetention(
                         dim_model = dim_model,
@@ -54,6 +55,7 @@ class RetNet(nn.Module):
                     )
                 )
             ) for _ in range(num_layer)]
+        )
 
     def forward(
         self,
