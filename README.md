@@ -10,10 +10,14 @@ Basic usage of the RetNet model:
 import torch
 from src.retnet import RetNet
 
+batch_size = 2
+seq_length = 1024
+dim_model = 512
+
 model = RetNet(
     num_layer = 6,
     num_heads = 8,
-    dim_model = 512,
+    dim_model = dim_model,
     dropout = 0.1,
     value_factor = 2,
     msr_gate_fn = 'gelu',
@@ -22,12 +26,33 @@ model = RetNet(
     mlp_bias = True,
 ).cuda()
 
-x = torch.randint(0, 1000, (1, 1024)).cuda()
+x = torch.randint(0, 100, (batch_size, seq_length, dim_model), dtype=torch.float32)
 
 # Use num_chunks parameter to switch between the parallel and recurrent forward passes.
-parallel_forward = model(x, num_chunks = None)
-recurrent_forward = model(x, num_chunks = 8)
+parallel_forward  = model(x, attn_mask='causal', num_chunks = None)
+recurrent_forward = model(x, attn_mask='causal', num_chunks = 8)
+
+# The two formulations should be consistent
+assert torch.allclose(parallel_forward, recurrent_forward)
 ```
+
+Model now has support for both attention mask and retention matrix normalizations as described in the paper.
+
+```python
+
+# This is the default model behavior
+no_nomalization_forward = model(x, attn_mask='causal', normalize_attn=False, normalize_retn=False, num_chunks = None)
+
+# Normalization can be switched on independently
+# ! Please NOTE that normalize_attn=True currently breaks consistency between parallel and recurrent forward
+only_attn_norm_forward = model(x, attn_mask='causal', normalize_attn=True, normalize_retn=False, num_chunks = None) 
+only_retn_norm_forward = model(x, attn_mask='causal', normalize_attn=False, normalize_retn=True, num_chunks = None)
+```
+
+# Known Issues
+
+- Consistency between `parallel` and `recurrent` formulation breaks down if attention mask is normalized as suggested in the original paper (normalization #2 in the paper).
+- Consistency between `parallel` and `recurrent` formulation seems unstable when a large number of `chunks` is used. This is possibly due to numerical errors that accumulate.
 
 # Citation
 
