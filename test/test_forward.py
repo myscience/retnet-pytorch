@@ -3,6 +3,7 @@ import unittest
 from torch import Tensor
 
 from src.retnet import RetNet
+from src.msr import MultiScaleRetention
 
 class ParallelForwardTest(unittest.TestCase):
 
@@ -130,8 +131,8 @@ class ConsistencyTest(unittest.TestCase):
         self.retnet = RetNet(
             num_layer = 1,
             num_heads = 2,
-            dim_model = 8,
-            dropout = 0.0,
+            dim_model = 4,
+            dropout = 0.0, # No randomness for this test
             value_factor = 2,
             msr_gate_fn = 'gelu',
             mlp_gate_fn = 'gelu',
@@ -139,18 +140,49 @@ class ConsistencyTest(unittest.TestCase):
             mlp_bias = True,
         )
 
+    def test_consistency_no_normalization(self):
         # Create a dummy input of correct shape
-        self.dummy_input = torch.randint(0, 100, (1, 5, 8), dtype=torch.float32)
+        dummy_input = torch.randint(0, 100, (1, 9, 4), dtype=torch.float32)
 
-    def test_consistency_parallel_recurrent(self):
         # Compute the output of the model
-        parallel_forward  = self.retnet(self.dummy_input, num_chunk=None)
-        recurrent_forward = self.retnet(self.dummy_input, num_chunk=2)
-
-        print(torch.abs(parallel_forward - recurrent_forward))
+        parallel_forward  = self.retnet(dummy_input, attn_mask='causal', num_chunk=None)
+        recurrent_forward = self.retnet(dummy_input, attn_mask='causal', num_chunk=3)
 
         # Check the consistency: the two output should match
-        self.assertTrue(torch.allclose(parallel_forward, recurrent_forward))
+        self.assertTrue(torch.allclose(parallel_forward, recurrent_forward, atol=1e-6))
+
+    def test_consistency_retn_normalization(self):
+        # Create a dummy input of correct shape
+        dummy_input = torch.randint(0, 100, (1, 9, 4), dtype=torch.float32)
+
+        # Compute the output of the model
+        parallel_forward  = self.retnet(dummy_input, attn_mask='causal', normalize_attn=False, normalize_retn=True, num_chunk=None)
+        recurrent_forward = self.retnet(dummy_input, attn_mask='causal', normalize_attn=False, normalize_retn=True, num_chunk=3)
+
+        # Check the consistency: the two output should match
+        self.assertTrue(torch.allclose(parallel_forward, recurrent_forward, atol=1e-6))
+
+    def test_consistency_attn_normalization(self):
+        # Create a dummy input of correct shape
+        dummy_input = torch.randint(0, 100, (1, 9, 4), dtype=torch.float32)
+
+        # Compute the output of the model
+        parallel_forward  = self.retnet(dummy_input, attn_mask='causal', normalize_attn=True, normalize_retn=False, num_chunk=None)
+        recurrent_forward = self.retnet(dummy_input, attn_mask='causal', normalize_attn=True, normalize_retn=False, num_chunk=3)
+
+        # Check the consistency: the two output should match
+        self.assertTrue(torch.allclose(parallel_forward, recurrent_forward, atol=1e-6))
+
+    def test_consistency_all_normalization(self):
+        # Create a dummy input of correct shape
+        dummy_input = torch.randint(0, 100, (1, 9, 4), dtype=torch.float32)
+
+        # Compute the output of the model
+        parallel_forward  = self.retnet(dummy_input, attn_mask='causal', normalize_attn=True, normalize_retn=True, num_chunk=None)
+        recurrent_forward = self.retnet(dummy_input, attn_mask='causal', normalize_attn=True, normalize_retn=True, num_chunk=3)
+
+        # Check the consistency: the two output should match
+        self.assertTrue(torch.allclose(parallel_forward, recurrent_forward, atol=1e-6))
 
 if __name__ == '__main__':
     unittest.main()

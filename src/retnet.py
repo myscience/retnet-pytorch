@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch import Tensor
-from typing import List
+from typing import List, Tuple
 
 from math import ceil
 
@@ -42,7 +42,7 @@ class RetNet(nn.Module):
         self.num_heads = num_heads
         self.dim_model = dim_model
 
-        self.layers = nn.ModuleList(
+        self.layers : List[Tuple[MultiScaleRetention, MLP]] = nn.ModuleList(
             [nn.ModuleList(
                 (
                     MultiScaleRetention(
@@ -67,6 +67,7 @@ class RetNet(nn.Module):
         x : Tensor,
         num_chunk : int | None = None,
         attn_mask : Tensor | str | None = None,
+        **kwargs,
     ) -> Tensor:
         '''
             Forward pass of the RetNet. Can use either the parallel implementation
@@ -103,9 +104,9 @@ class RetNet(nn.Module):
 
         for msr, mlp in self.layers:
             # These are eq.(9) in the original paper
-            # NOTE: Both MSR and MLP do layer normalization on the input
+            # NOTE: Both MSR and MLP do layer normalization on their input
             #       before the attention and MLP computations.
-            x = msr(x, num_chunk=num_chunk, attn_mask=attn_mask) + x
+            x = msr(x, num_chunk=num_chunk, attn_mask=attn_mask, **kwargs) + x
             x = mlp(x) + x
 
         return x
@@ -121,4 +122,4 @@ class RetNet(nn.Module):
         attn_mask = torch.tril(torch.ones(attn_dim, attn_dim, device=device))
         attn_mask = torch.masked_fill(attn_val[:, None] - attn_val[None, :], ~attn_mask.bool(), torch.inf)
 
-        return torch.exp(attn_mask)
+        return attn_mask
