@@ -142,11 +142,11 @@ class ConsistencyTest(unittest.TestCase):
 
     def test_consistency_no_normalization(self):
         # Create a dummy input of correct shape
-        dummy_input = torch.randint(0, 100, (1, 9, 4), dtype=torch.float32)
+        dummy_input = torch.randint(0, 100, (1, 1024, 4), dtype=torch.float32)
 
         # Compute the output of the model
         parallel_forward  = self.retnet(dummy_input, attn_mask='causal', num_chunk=None)
-        recurrent_forward = self.retnet(dummy_input, attn_mask='causal', num_chunk=3)
+        recurrent_forward = self.retnet(dummy_input, attn_mask='causal', num_chunk=8)
 
         # Check the consistency: the two output should match
         self.assertTrue(torch.allclose(parallel_forward, recurrent_forward, atol=1e-6))
